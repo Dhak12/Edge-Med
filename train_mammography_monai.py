@@ -1,16 +1,22 @@
 """
 ================================================================================
-EdgeMed :: Mammography Branch (CBIS-DDSM) — MONAI Training Script
+EdgeMed :: Mammography Branch — MONAI Training Script (folder-per-class data)
 ================================================================================
-Training target : local RTX 4070 (CUDA)
+Training target : local machine (CPU now, RTX 4070 later)
 Deployment target: Jetson Orin Nano (ONNX -> TensorRT, later)
 Framework        : MONAI (Medical Open Network for AI), built on PyTorch
 
+Dataset layout expected (matches your pendrive):
+    DATA_ROOT/
+        benign/     *.png / *.jpg
+        malignant/  *.png / *.jpg
+        normal/     *.png / *.jpg
+
 --------------------------------------------------------------------------------
-REQUIREMENTS  (save this block as requirements.txt, or just pip install below)
+REQUIREMENTS  (copy into requirements.txt, or pip install directly)
 --------------------------------------------------------------------------------
-torch>=2.1.0            # install the CUDA 12.x build for RTX 4070:
-                         # pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0             # CPU now: pip install torch torchvision
+                          # RTX 4070 later: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 torchvision>=0.16.0
 monai>=1.3.0
 pandas>=2.0.0
@@ -19,23 +25,16 @@ Pillow>=10.0.0
 scikit-learn>=1.3.0
 tqdm>=4.66.0
 onnx>=1.15.0
-onnxruntime-gpu>=1.16.0
-
-Quick install (RTX 4070, CUDA 12.1):
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-    pip install monai pandas numpy pillow scikit-learn tqdm onnx onnxruntime-gpu
-
---------------------------------------------------------------------------------
-DATASET — fill this in once your data is available
---------------------------------------------------------------------------------
+onnxruntime>=1.16.0      # swap for onnxruntime-gpu once on the RTX 4070
+================================================================================
 """
 
 import os
+import glob
 import time
 import copy
 import json
 import numpy as np
-import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -46,42 +45,45 @@ from monai.data import Dataset as MonaiDataset
 from monai.networks.nets import DenseNet121
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd, Resized,
-    RandFlipd, RandRotate90d, RandAdjustContrastd, ToTensord, EnsureTyped,
+    RandFlipd, RandRotate90d, RandAdjustContrastd, EnsureTyped, RepeatChanneld,
 )
 
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 from tqdm import tqdm
 
 # ==============================================================================
 # >>> ADD YOUR DATASET HERE <<<
 # ------------------------------------------------------------------------------
-# DATA_ROOT -> folder containing your images + csv/ subfolder
-# TRAIN_CSV -> training case-description CSV, relative to DATA_ROOT
-# TEST_CSV  -> test case-description CSV, relative to DATA_ROOT
+# DATA_ROOT must point directly at the folder that CONTAINS benign/ malignant/
+# normal/ subfolders — i.e. your "CLAHE_images" folder.
 #
-# Example (local, RTX 4070 machine):
-#   DATA_ROOT = "D:/EdgeMed/mammography_data"
-#   TRAIN_CSV = "csv/calc_case_description_train_set.csv"
-#   TEST_CSV  = "csv/calc_case_description_test_set.csv"
+# From your screenshot, on Windows this looks like:
+#   DATA_ROOT = "D:/MAMOGRPHY/archive (2)/CLAHE_images"
 # ==============================================================================
-DATA_ROOT = ""   # <-- FILL THIS IN
-TRAIN_CSV = ""   # <-- FILL THIS IN
-TEST_CSV  = ""   # <-- FILL THIS IN
+ONNX_PATH = "./checkpoints/mammography_densenet121.onnx"
+DATA_ROOT = "C:/Users/DELL/Desktop/dhakshita/7th SEM/Edge Med/mamography/archive (2)/CLAHE_images"   # <-- FILL THIS IN, e.g. "D:/MAMOGRPHY/archive (2)/CLAHE_images"
 # ==============================================================================
+
+CLASS_NAMES = ["benign", "malignant", "normal"]   # folder names = class names, in label order
+
+# ==============================================================================
+# QUICK_TEST_MODE — leave True while on CPU. Shrinks everything so you can
+# verify the pipeline runs end-to-end in minutes. Flip to False on the RTX 4070.
+# ==============================================================================
+QUICK_TEST_MODE = True
 
 CONFIG = {
     "data_root": DATA_ROOT,
-    "train_csv": TRAIN_CSV,
-    "test_csv": TEST_CSV,
-    "image_col": "cropped image file path",
-    "label_col": "pathology",           # BENIGN / BENIGN_WITHOUT_CALLBACK / MALIGNANT
-    "img_size": 224,
-    "batch_size": 64,                   # RTX 4070 (12GB) comfortably handles 64 at 224x224
-    "epochs": 25,
+    "img_size": 96 if QUICK_TEST_MODE else 224,
+    "batch_size": 8 if QUICK_TEST_MODE else 64,
+    "epochs": 2 if QUICK_TEST_MODE else 25,
+    "max_samples_per_class": 20 if QUICK_TEST_MODE else None,  # caps data for the smoke test
     "lr": 3e-4,
     "weight_decay": 1e-4,
     "val_split": 0.15,
-    "num_workers": 4,
+    "test_split": 0.15,
+    "num_workers": 0 if QUICK_TEST_MODE else 4,
     "seed": 42,
     "checkpoint_dir": "./checkpoints",
     "onnx_export_path": "./checkpoints/mammography_densenet121.onnx",
@@ -94,27 +96,40 @@ np.random.seed(CONFIG["seed"])
 
 
 # ------------------------------------------------------------------------------
-# DATA PREP — build MONAI-style list-of-dicts and CSV loader
+# DATA PREP — scan benign/ malignant/ normal/ subfolders directly (no CSV)
 # ------------------------------------------------------------------------------
-def build_data_list(csv_path, root):
-    df = pd.read_csv(csv_path)
-    df["image_path"] = df[CONFIG["image_col"]].astype(str).str.strip()
-    df = df.dropna(subset=["image_path", CONFIG["label_col"]])
+def build_data_list(data_root, max_per_class=None):
     data = []
-    for _, row in df.iterrows():
-        label = 1 if "MALIGNANT" in str(row[CONFIG["label_col"]]).upper() else 0
-        data.append({"img": os.path.join(root, row["image_path"]), "label": label})
+    exts = ("*.png", "*.jpg", "*.jpeg")
+    for label_idx, class_name in enumerate(CLASS_NAMES):
+        class_dir = os.path.join(data_root, class_name)
+        files = []
+        for ext in exts:
+            files.extend(glob.glob(os.path.join(class_dir, ext)))
+        if not files:
+            print(f"[!] WARNING: no images found in {class_dir} — check DATA_ROOT and folder names.")
+        if max_per_class:
+            np.random.shuffle(files)
+            files = files[:max_per_class]
+        for f in files:
+            data.append({"img": f, "label": label_idx})
+        print(f"  {class_name}: {len(files)} images")
     return data
 
 
 # ------------------------------------------------------------------------------
 # MONAI TRANSFORMS
 # ------------------------------------------------------------------------------
+# NOTE: CLAHE mammography images are grayscale (1 channel). DenseNet121 is
+# pretrained on 3-channel ImageNet, so RepeatChanneld duplicates the single
+# channel into 3 identical channels — the standard fix for feeding grayscale
+# medical images into an RGB-pretrained backbone.
 train_transforms = Compose([
     LoadImaged(keys=["img"], image_only=True),
     EnsureChannelFirstd(keys=["img"]),
     ScaleIntensityd(keys=["img"]),
     Resized(keys=["img"], spatial_size=(CONFIG["img_size"], CONFIG["img_size"])),
+    RepeatChanneld(keys=["img"], repeats=3),
     RandFlipd(keys=["img"], prob=0.5, spatial_axis=0),
     RandRotate90d(keys=["img"], prob=0.5),
     RandAdjustContrastd(keys=["img"], prob=0.3),
@@ -126,25 +141,20 @@ eval_transforms = Compose([
     EnsureChannelFirstd(keys=["img"]),
     ScaleIntensityd(keys=["img"]),
     Resized(keys=["img"], spatial_size=(CONFIG["img_size"], CONFIG["img_size"])),
+    RepeatChanneld(keys=["img"], repeats=3),
     EnsureTyped(keys=["img"], dtype=torch.float32),
 ])
 
 
 # ------------------------------------------------------------------------------
-# MODEL — MONAI DenseNet121 (2D, 3-channel, transfer-learned)
+# MODEL — MONAI DenseNet121, 3-class (benign / malignant / normal)
 # ------------------------------------------------------------------------------
-def build_model(num_classes=2):
-    model = DenseNet121(
-        spatial_dims=2,
-        in_channels=3,
-        out_channels=num_classes,
-        pretrained=True,
-    )
-    return model
+def build_model(num_classes=3):
+    return DenseNet121(spatial_dims=2, in_channels=3, out_channels=num_classes, pretrained=True)
 
 
 # ------------------------------------------------------------------------------
-# TRAIN / EVAL LOOP
+# TRAIN / EVAL LOOP (multi-class metrics)
 # ------------------------------------------------------------------------------
 def run_epoch(model, loader, criterion, optimizer=None):
     is_train = optimizer is not None
@@ -168,7 +178,7 @@ def run_epoch(model, loader, criterion, optimizer=None):
             optimizer.step()
 
         running_loss += loss.item() * imgs.size(0)
-        probs = torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy()
+        probs = torch.softmax(outputs, dim=1).detach().cpu().numpy()
         preds = outputs.argmax(dim=1).detach().cpu().numpy()
 
         all_probs.extend(probs)
@@ -178,10 +188,10 @@ def run_epoch(model, loader, criterion, optimizer=None):
     epoch_loss = running_loss / len(loader.dataset)
     acc = accuracy_score(all_labels, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average="binary", zero_division=0
+        all_labels, all_preds, average="macro", zero_division=0
     )
     try:
-        auc = roc_auc_score(all_labels, all_probs)
+        auc = roc_auc_score(all_labels, all_probs, multi_class="ovr", average="macro")
     except ValueError:
         auc = float("nan")
 
@@ -200,17 +210,18 @@ def main():
     if CONFIG["device"] == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    full_train_data = build_data_list(
-        os.path.join(CONFIG["data_root"], CONFIG["train_csv"]), CONFIG["data_root"]
-    )
-    test_data = build_data_list(
-        os.path.join(CONFIG["data_root"], CONFIG["test_csv"]), CONFIG["data_root"]
-    )
+    print("Scanning dataset...")
+    all_data = build_data_list(CONFIG["data_root"], CONFIG["max_samples_per_class"])
+    labels = [d["label"] for d in all_data]
 
-    np.random.shuffle(full_train_data)
-    val_size = int(len(full_train_data) * CONFIG["val_split"])
-    val_data = full_train_data[:val_size]
-    train_data = full_train_data[val_size:]
+    train_data, temp_data, train_labels, temp_labels = train_test_split(
+        all_data, labels, test_size=CONFIG["val_split"] + CONFIG["test_split"],
+        stratify=labels, random_state=CONFIG["seed"]
+    )
+    relative_test = CONFIG["test_split"] / (CONFIG["val_split"] + CONFIG["test_split"])
+    val_data, test_data = train_test_split(
+        temp_data, test_size=relative_test, stratify=temp_labels, random_state=CONFIG["seed"]
+    )
 
     train_ds = MonaiDataset(train_data, transform=train_transforms)
     val_ds = MonaiDataset(val_data, transform=eval_transforms)
@@ -225,7 +236,7 @@ def main():
 
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
 
-    model = build_model(num_classes=2).to(CONFIG["device"])
+    model = build_model(num_classes=len(CLASS_NAMES)).to(CONFIG["device"])
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"])
@@ -283,36 +294,31 @@ if __name__ == "__main__":
 ================================================================================
 SAMPLE / PROBABLE OUTPUT  (illustrative — real numbers depend on your data)
 ================================================================================
-Device: cuda
-GPU: NVIDIA GeForce RTX 4070
-Train: 2136 | Val: 377 | Test: 645
+Device: cpu
+Scanning dataset...
+  benign: 20 images
+  malignant: 20 images
+  normal: 20 images
+Train: 42 | Val: 9 | Test: 9
 
-Epoch 01/25 | train_loss 0.6598 acc 0.6041 | val_loss 0.6301 acc 0.6259 f1 0.6014 auc 0.6488 | 18.3s
-Epoch 02/25 | train_loss 0.5872 acc 0.6733 | val_loss 0.5714 acc 0.6870 f1 0.6602 auc 0.7091 | 17.9s
-Epoch 03/25 | train_loss 0.5241 acc 0.7228 | val_loss 0.5203 acc 0.7347 f1 0.7145 auc 0.7622 | 18.1s
-...
-Epoch 12/25 | train_loss 0.3327 acc 0.8544 | val_loss 0.3798 acc 0.8330 f1 0.8188 auc 0.8710 | 18.0s
-...
-Epoch 25/25 | train_loss 0.1721 acc 0.9336 | val_loss 0.2914 acc 0.8827 f1 0.8691 auc 0.9203 | 17.8s
+Epoch 01/2 | train_loss 1.0821 acc 0.4286 | val_loss 1.0512 acc 0.4444 f1 0.3981 auc 0.5920 | 12.4s
+Epoch 02/2 | train_loss 0.9247 acc 0.5714 | val_loss 0.9884 acc 0.5556 f1 0.5312 auc 0.6540 | 11.9s
 
 === Final Test Metrics (best val checkpoint) ===
-      loss: 0.2984
-       acc: 0.8798
- precision: 0.8672
-    recall: 0.8531
-        f1: 0.8601
-       auc: 0.9147
+      loss: 0.9765
+       acc: 0.5556
+ precision: 0.5417
+    recall: 0.5556
+        f1: 0.5312
+       auc: 0.6472
 
 ONNX model exported to ./checkpoints/mammography_densenet121.onnx (27.14 MB)
 Next: convert ONNX -> TensorRT engine (trtexec --onnx=... --fp16) for Jetson Orin Nano.
 
-NOTE: RTX 4070 training is roughly 2x faster per epoch than a Kaggle T4/P100
-for this batch size. DenseNet121 is heavier than MobileNetV3 (~27MB vs ~6MB
-ONNX), so for the final Jetson Orin Nano deployment you'll likely want to
-either (a) prune/quantize this DenseNet121 to INT8 via TensorRT, or (b) swap
-the backbone to something smaller (MobileNetV3, EfficientNet-B0) once you've
-confirmed DenseNet121's accuracy ceiling on your actual data. Train on the
-4070 with the heavier model first to establish a strong baseline, then
-decide whether the accuracy/size tradeoff is worth optimizing further.
+NOTE: This is QUICK_TEST_MODE output (2 epochs, 20 images/class) — it's only
+meant to confirm the pipeline runs end-to-end. Numbers are close to random
+guessing (33% for 3 classes) because there isn't enough data/epochs to learn
+anything yet. Once on the RTX 4070, set QUICK_TEST_MODE = False to train on
+the full dataset for 25 epochs — expect accuracy/AUC to climb well above this.
 ================================================================================
 """

@@ -1,0 +1,8 @@
+venv/
+archive*.zip
+archive*/
+checkpoints/*.onnx
+checkpoints/*.onnx.data
+checkpoints/*.pt
+__pycache__/
+*.pyc
