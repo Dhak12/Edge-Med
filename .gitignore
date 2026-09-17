@@ -1,10 +1,28 @@
-﻿venv/
+# EdgeMed - local environment
+venv/
+
+# Datasets
 data/
 busi-whu-seg/
+archive*/
+archive*.zip
+
+# Trained models / checkpoints
 models/*.pth
+checkpoints/*.onnx
+checkpoints/*.onnx.data
+checkpoints/*.pt
+
+# Python cache
 __pycache__/
 *.pyc
+
+# VS Code
 .vscode/
+
+# Jupyter
 .ipynb_checkpoints/
+
+# OS files
 .DS_Store
 Thumbs.db
