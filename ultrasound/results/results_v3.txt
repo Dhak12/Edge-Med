@@ -1,0 +1,21 @@
+EdgeMed Version 3
+=================
+
+Test Accuracy: 90.45%
+Test Macro F1: 0.9051
+
+Classification Report:
+              precision    recall  f1-score   support
+
+      benign     0.9286    0.9010    0.9146       303
+   malignant     0.8750    0.8647    0.8698       170
+      normal     0.8860    0.9806    0.9309       103
+
+    accuracy                         0.9045       576
+   macro avg     0.8965    0.9154    0.9051       576
+weighted avg     0.9051    0.9045    0.9043       576
+
+Confusion Matrix:
+[[273  21   9]
+ [ 19 147   4]
+ [  2   0 101]]
