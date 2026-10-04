@@ -1,0 +1,8 @@
+torch
+torchvision
+monai==1.6.0
+numpy
+pandas
+Pillow
+scikit-learn
+matplotlib
